@@ -15,6 +15,10 @@ A self-contained web-based inventory system for the VTCC maintenance store. It u
 - Dashboard for below-minimum and above-maximum stock levels.
 - Request, return, approval, and stock movement history.
 
+## Design documentation
+
+See [SYSTEM_DESIGN.md](SYSTEM_DESIGN.md) for UML diagrams, workflows, API structure, and database structure.
+
 ## Run
 
 ```powershell
