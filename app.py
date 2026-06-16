@@ -525,7 +525,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     init_db()
-    host = os.environ.get("HOST", "127.0.0.1")
+    host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8000"))
     print(f"VTCC Inventory running at http://{host}:{port}")
     ThreadingHTTPServer((host, port), Handler).serve_forever()
