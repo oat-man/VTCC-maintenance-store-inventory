@@ -8,8 +8,8 @@ A self-contained web-based inventory system for the VTCC maintenance store. It u
 - Role-based access:
   - `administrator`: all modules, users, equipment, requests, dashboard.
   - `front_end`: request and return equipment.
-  - `store_manager`: approve or reject requests and returns.
-  - `store`: check and update equipment in store.
+  - `store_manager`: create equipment and manage master data.
+  - `store`: check and update existing equipment in store.
 - QR-code style equipment marker display and browser camera scanning using `BarcodeDetector` when supported.
 - Manual equipment number entry for all browsers.
 - Dashboard for below-minimum and above-maximum stock levels.
@@ -48,3 +48,4 @@ Change these passwords before production use.
 - Place the app behind HTTPS so camera-based QR scanning works reliably.
 - Replace SQLite with PostgreSQL or MySQL if multiple concurrent sites or central enterprise hosting is required.
 - Add organization-specific approval rules, audit reports, and backup policy before live operation.
+# vtcc-store-inventory version 0.7
