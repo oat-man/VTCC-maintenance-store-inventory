@@ -284,7 +284,7 @@ async function loadEquipment(q = "", manage = false) {
     : "";
   content(
     manage ? "Equipment manage" : "Current equipment",
-    `<p class="hint">Equipment identity and details are maintained here. Quantities can only change through Incoming equipment or Outgoing equipment.</p><div class="inventory-layout"><section class="panel"><div class="toolbar"><input id="search" placeholder="Search equipment or scan QR code"><button id="searchBtn" class="secondary">Search</button><button id="scanBtn" class="secondary">Scan QR</button></div><div id="scanArea" class="hidden"><video id="reader" muted playsinline></video></div><div class="table-wrap">${equipmentTable(data.equipment, manage)}</div><div id="tracePanel"></div></section><section class="panel"><h2>Equipment details</h2>${equipmentForm(draft, m, manage)}<div id="qrPreview" class="qr-box">
+    `<p class="hint">Equipment identity and details are maintained here. Quantities can only change through Incoming equipment or Outgoing equipment.</p><div class="inventory-layout"><section class="panel"><div class="toolbar"><input id="search" placeholder="Search equipment or scan QR code"><button id="searchBtn" class="secondary">Search</button><button id="scanBtn" class="secondary">Scan QR</button></div><div id="scanArea" class="hidden"><div id="reader"></div></div><div class="table-wrap">${equipmentTable(data.equipment, manage)}</div><div id="tracePanel"></div></section><section class="panel"><h2>Equipment details</h2>${equipmentForm(draft, m, manage)}<div id="qrPreview" class="qr-box">
     ${draft.equipment_no ? "" : "QR-Code will show after generation"}</div></section></div>`,
     equipmentTools,
   );
@@ -595,41 +595,53 @@ function parseEquipmentNoFromQr(value) {
 */
 
 function parseEquipmentNoFromQr(value) {
-  return String(value || "").trim();
+  return String(value || "")
+    .trim()
+    .replace(/^VTCC-EQ:/, "");
 }
 
+let activeScanner = null;
+
 async function startScanner(onValue) {
-  const area = document.querySelector("#scanArea"),
-    video = document.querySelector("#reader");
+  const area = document.querySelector("#scanArea");
+  if (!area) return;
+
   area.classList.remove("hidden");
+  area.innerHTML = `<div id="reader"></div>`;
+
+  if (typeof Html5Qrcode === "undefined") {
+    area.innerHTML = `<p class="message">html5-qrcode.min.js is not loaded.</p>`;
+    return;
+  }
+
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: "environment" },
-    });
-    video.srcObject = stream;
-    await video.play();
-    if (!("BarcodeDetector" in window)) {
-      area.insertAdjacentHTML(
-        "beforeend",
-        '<p class="hint">Automatic QR detection is not supported by this browser.</p>',
-      );
-      return;
+    if (activeScanner) {
+      await activeScanner.stop().catch(() => {});
+      activeScanner.clear();
     }
-    const detector = new BarcodeDetector({ formats: ["qr_code"] });
-    const tick = async () => {
-      if (!video.srcObject) return;
-      const codes = await detector.detect(video);
-      if (codes.length) {
-        const value = codes[0].rawValue.trim();
-        stream.getTracks().forEach((t) => t.stop());
+
+    activeScanner = new Html5Qrcode("reader");
+
+    await activeScanner.start(
+      { facingMode: "environment" },
+      {
+        fps: 10,
+        qrbox: { width: 250, height: 250 },
+      },
+      async (decodedText) => {
+        const value = parseEquipmentNoFromQr(decodedText);
+
+        await activeScanner.stop().catch(() => {});
+        activeScanner.clear();
+        activeScanner = null;
+
+        area.classList.add("hidden");
         onValue(value);
-        return;
-      }
-      requestAnimationFrame(tick);
-    };
-    tick();
+      },
+      () => {},
+    );
   } catch (err) {
-    area.innerHTML = `<p class="message">${esc(err.message)}</p>`;
+    area.innerHTML = `<p class="message">${esc(err.message || err)}</p>`;
   }
 }
 
