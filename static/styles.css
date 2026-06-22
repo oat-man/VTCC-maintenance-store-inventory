@@ -382,6 +382,92 @@ tbody tr:hover td {
 .sidebar.collapsed .nav-group-label {
   color: transparent;
 }
- (max-width: 920px) {
+@media (max-width: 920px) {
   .sidebar.collapsed .nav-group-label { color: #98a2b3; }
+}
+
+
+.role-options { display: grid; gap: 6px; padding-top: 6px; }
+.role-options label { display: flex; align-items: center; gap: 7px; font-weight: 500; }
+.role-options input { width: auto; }
+fieldset { border: 1px solid #d6dde7; border-radius: 6px; padding: 8px 12px 12px; }
+legend { padding: 0 4px; font-weight: 600; }
+
+/* Equipment quantity workflows */
+.grow { flex: 1 1 320px; }
+.trace-panel { margin-top: 16px; padding-top: 16px; border-top: 2px solid var(--brand); }
+.check-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(150px, 1fr));
+  gap: 12px;
+}
+.check-summary span {
+  display: grid;
+  gap: 7px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #f8fafc;
+  color: var(--muted);
+}
+.check-summary b { color: var(--ink); font-size: 22px; }
+.qty-in { color: var(--ok) !important; font-weight: 700; }
+.qty-out { color: var(--danger) !important; font-weight: 700; }
+@media (max-width: 700px) {
+  .check-summary { grid-template-columns: 1fr; }
+}
+
+
+/* Workflow design-system layer */
+:root {
+  --color-bg-canvas: #eef2f6;
+  --color-bg-surface: #ffffff;
+  --color-text-primary: #101828;
+  --color-text-secondary: #475467;
+  --color-border: #d0d5dd;
+  --color-action: #0f4c81;
+  --color-focus: #1570ef;
+  --color-success: #067647;
+  --color-warning: #b54708;
+  --color-critical: #b42318;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --shadow-sm: 0 1px 2px rgba(16, 24, 40, .05);
+}
+button, input, select, textarea { min-height: 44px; }
+button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible,
+[tabindex]:focus-visible {
+  outline: 3px solid rgba(21, 112, 239, .28);
+  outline-offset: 2px;
+}
+button.icon-btn {
+  width: auto;
+  min-width: 44px;
+  padding: 8px;
+  text-align: center;
+}
+.badge.warning {
+  color: #93370d;
+  background: #fffaeb;
+  border-color: #fedf89;
+}
+.badge.critical {
+  color: #912018;
+  background: #fef3f2;
+  border-color: #fecdca;
+}
+.badge.ok {
+  color: #05603a;
+  background: #ecfdf3;
+}
+.panel + .panel { margin-top: var(--space-4); }
+td .actions { min-width: 170px; }
+tbody tr:focus-within td { background: #f5faff; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
 }

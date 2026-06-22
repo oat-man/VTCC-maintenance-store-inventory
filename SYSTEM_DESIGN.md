@@ -492,3 +492,42 @@ CREATE TABLE IF NOT EXISTS stock_movements (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 ```
+
+
+## Enterprise approval extension
+
+### Separation of duties
+
+| Activity | Store Officer | Store Manager |
+| --- | --- | --- |
+| Prepare request | Yes | No |
+| Final request decision | No | Yes |
+| Receive returned goods | Yes | No |
+| Inspect and recommend disposition | Yes | No |
+| Final return disposition | No | Yes |
+| Propose stock movement/count | Yes | No |
+| Approve and post stock movement | No | Yes |
+
+### Request states
+
+pending -> pending_manager_approval -> manager_approved -> delivered -> completed
+
+A Manager can reject at the approval stage.
+
+### Return states
+
+pending -> pending_manager_acceptance -> manager_accepted -> return_delivered -> returned_goods -> completed
+
+Each item in Returned Goods independently moves through:
+
+awaiting_inspection -> pending_manager_restock -> in_stock
+
+or:
+
+awaiting_inspection -> pending_manager_discontinue -> discontinued
+
+### Stock proposal states
+
+pending_manager -> approved_posted or rejected
+
+Only the transition to approved_posted creates a stock movement and changes balances.

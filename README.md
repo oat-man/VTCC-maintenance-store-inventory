@@ -48,4 +48,17 @@ Change these passwords before production use.
 - Place the app behind HTTPS so camera-based QR scanning works reliably.
 - Replace SQLite with PostgreSQL or MySQL if multiple concurrent sites or central enterprise hosting is required.
 - Add organization-specific approval rules, audit reports, and backup policy before live operation.
-# vtcc-store-inventory version 0.7
+
+
+## Enterprise workflow
+
+The application enforces separation of duties:
+
+- Store Officers prepare requests, receive and inspect returns, and submit stock proposals.
+- Store Managers make final request/return decisions and approve stock postings.
+- Stock quantities do not change when an Officer submits a proposal. They change only when a Manager approves and posts it.
+- Returned items are held in the controlled Returned Goods area until inspection and final disposition.
+- Manager-approved returned items become either In Stock or Discontinued.
+- Administrator access remains focused on users, multi-role assignments, and Syslog.
+
+Role-focused workspaces include an Officer Operations Queue, Manager Approval Center, separate Equipment/Catalog/Group/Location screens, Returned Goods, and Officer Activity.

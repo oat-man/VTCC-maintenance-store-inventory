@@ -20,11 +20,15 @@ SESSION_SECRET = os.environ.get("SESSION_SECRET", "change-this-secret-for-produc
 
 ROLE_PERMISSIONS = {
     "administrator": {"all"},
-    "front_end": {"request:create", "return:create", "inventory:read", "notifications:read"},
-    "store_manager": {"master:manage", "equipment:create", "orders:read", "inventory:read", "dashboard:read"},
+    "front_end": {"request:create", "return:create", "inventory:read", "notifications:read", "dashboard:read"},
+    "store_manager": {
+        "master:manage", "equipment:create", "equipment:update", "orders:read", "inventory:read",
+        "dashboard:read", "request:final_approve", "return:final_approve", "movement:approve",
+        "audit:read", "notifications:read"
+    },
     "store": {
-        "inventory:read", "equipment:update", "purchase:create", "request:manage", "return:manage",
-        "movement:check", "orders:read", "dashboard:read", "notifications:read"
+        "inventory:read", "purchase:create", "request:prepare", "return:receive", "return:inspect",
+        "movement:propose", "orders:read", "dashboard:read", "notifications:read"
     },
 }
 
@@ -32,7 +36,7 @@ ROLE_LABELS = {
     "administrator": "Administrator",
     "front_end": "Front-end User",
     "store": "Store Officer",
-    "store_manager": "Store Manager",
+    "store_manager": "Manager",
 }
 
 
@@ -59,6 +63,13 @@ def table_columns(conn, table):
 
 
 def migrate_schema(conn):
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS user_roles (
+               user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+               role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+               PRIMARY KEY (user_id, role_id)
+           )"""
+    )
     equipment_cols = table_columns(conn, "equipment")
     for column, ddl in (
         ("category_id", "ALTER TABLE equipment ADD COLUMN category_id INTEGER REFERENCES categories(id)"),
@@ -71,6 +82,130 @@ def migrate_schema(conn):
     for table in ("categories", "groups", "locations"):
         if "active" not in table_columns(conn, table):
             conn.execute(f"ALTER TABLE {table} ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+    movement_cols = table_columns(conn, "stock_movements")
+    for column, ddl in (
+        ("source_type", "ALTER TABLE stock_movements ADD COLUMN source_type TEXT DEFAULT ''"),
+        ("system_quantity", "ALTER TABLE stock_movements ADD COLUMN system_quantity INTEGER"),
+        ("balance_after", "ALTER TABLE stock_movements ADD COLUMN balance_after INTEGER"),
+        ("location_id", "ALTER TABLE stock_movements ADD COLUMN location_id INTEGER REFERENCES locations(id)"),
+        ("lot_reference", "ALTER TABLE stock_movements ADD COLUMN lot_reference TEXT DEFAULT ''"),
+        ("location_quantity", "ALTER TABLE stock_movements ADD COLUMN location_quantity INTEGER"),
+        ("location_balance_after", "ALTER TABLE stock_movements ADD COLUMN location_balance_after INTEGER"),
+        ("allocation_id", "ALTER TABLE stock_movements ADD COLUMN allocation_id INTEGER REFERENCES stock_balances(id)"),
+    ):
+        if column not in movement_cols:
+            conn.execute(ddl)
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS stock_balances (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            equipment_id INTEGER NOT NULL REFERENCES equipment(id),
+            location_id INTEGER NOT NULL REFERENCES locations(id),
+            source_type TEXT NOT NULL,
+            lot_reference TEXT NOT NULL,
+            quantity INTEGER NOT NULL DEFAULT 0 CHECK(quantity >= 0),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(equipment_id, location_id, source_type, lot_reference)
+        );
+        CREATE TRIGGER IF NOT EXISTS sync_legacy_equipment_quantity
+        AFTER UPDATE OF quantity ON equipment
+        WHEN NEW.quantity != OLD.quantity
+         AND COALESCE((SELECT SUM(quantity) FROM stock_balances WHERE equipment_id=NEW.id), 0) != NEW.quantity
+        BEGIN
+            INSERT OR IGNORE INTO stock_balances
+                (equipment_id, location_id, source_type, lot_reference, quantity)
+            VALUES (NEW.id, NEW.location_id, 'legacy_adjustment', 'LEGACY', 0);
+            UPDATE stock_balances
+            SET quantity = quantity + NEW.quantity -
+                    (SELECT SUM(quantity) FROM stock_balances WHERE equipment_id=NEW.id),
+                updated_at=CURRENT_TIMESTAMP
+            WHERE equipment_id=NEW.id AND location_id=NEW.location_id
+              AND source_type='legacy_adjustment' AND lot_reference='LEGACY';
+        END;
+
+        CREATE TABLE IF NOT EXISTS stock_proposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            proposer_id INTEGER NOT NULL REFERENCES users(id),
+            reviewer_id INTEGER REFERENCES users(id),
+            source_type TEXT NOT NULL,
+            equipment_id INTEGER NOT NULL REFERENCES equipment(id),
+            location_id INTEGER NOT NULL REFERENCES locations(id),
+            allocation_id INTEGER REFERENCES stock_balances(id),
+            quantity INTEGER,
+            actual_quantity INTEGER,
+            expected_direction TEXT DEFAULT "",
+            lot_reference TEXT DEFAULT "",
+            reference TEXT DEFAULT "",
+            status TEXT NOT NULL DEFAULT "pending_manager",
+            review_comment TEXT DEFAULT "",
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            decided_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS returned_goods (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+            order_item_id INTEGER NOT NULL REFERENCES order_items(id) ON DELETE CASCADE,
+            equipment_id INTEGER NOT NULL REFERENCES equipment(id),
+            quantity INTEGER NOT NULL CHECK(quantity > 0),
+            receiving_location_id INTEGER REFERENCES locations(id),
+            received_by INTEGER NOT NULL REFERENCES users(id),
+            inspected_by INTEGER REFERENCES users(id),
+            decided_by INTEGER REFERENCES users(id),
+            disposition TEXT DEFAULT "",
+            status TEXT NOT NULL DEFAULT "awaiting_inspection",
+            inspection_note TEXT DEFAULT "",
+            manager_comment TEXT DEFAULT "",
+            received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            inspected_at TEXT,
+            decided_at TEXT,
+            UNIQUE(order_item_id)
+        );
+        """
+    )
+
+
+def sync_user_roles(conn):
+    conn.execute(
+        """INSERT OR IGNORE INTO user_roles (user_id, role_id)
+           SELECT u.id, r.id FROM users u JOIN roles r ON r.role_key=u.role"""
+    )
+
+
+def user_roles(conn, user_id):
+    return [row["role_key"] for row in conn.execute(
+        """SELECT r.role_key FROM user_roles ur JOIN roles r ON r.id=ur.role_id
+           WHERE ur.user_id=? ORDER BY CASE r.role_key
+             WHEN 'administrator' THEN 1 WHEN 'store_manager' THEN 2 WHEN 'store' THEN 3 ELSE 4 END""",
+        (user_id,),
+    ).fetchall()]
+
+
+def set_user_roles(conn, user_id, role_keys):
+    if isinstance(role_keys, str):
+        role_keys = [role_keys]
+    role_keys = list(dict.fromkeys(role_keys or []))
+    if not role_keys or any(role not in ROLE_PERMISSIONS for role in role_keys):
+        raise ValueError("At least one valid role is required")
+    placeholders = ",".join("?" for _ in role_keys)
+    role_rows = conn.execute(
+        f"SELECT id,role_key FROM roles WHERE role_key IN ({placeholders})", tuple(role_keys)
+    ).fetchall()
+    if len(role_rows) != len(role_keys):
+        raise ValueError("One or more roles are invalid")
+    conn.execute("DELETE FROM user_roles WHERE user_id=?", (user_id,))
+    conn.executemany("INSERT INTO user_roles (user_id,role_id) VALUES (?,?)", [(user_id, row["id"]) for row in role_rows])
+    conn.execute("UPDATE users SET role=? WHERE id=?", (role_keys[0], user_id))
+
+
+def add_roles(conn, user):
+    if not user:
+        return None
+    result = dict(user)
+    result["roles"] = user_roles(conn, result["id"]) or [result["role"]]
+    result["role"] = result["roles"][0]
+    return result
 
 
 MASTER_TYPES = {
@@ -119,6 +254,8 @@ def seed_master_data(conn):
         ("LOC-B1", "Cabinet B1", "Electrical test cabinet"),
         ("LOC-C3", "Shelf C3", "Lighting spare shelf"),
         ("LOC-D2", "Bin D2", "Cable storage bin"),
+        ("AREA-RETURN", "Returned Goods", "Controlled quarantine area for received returns"),
+        ("AREA-DISC", "Discontinued Goods", "Controlled area for manager-approved discontinued goods"),
     ]
     conn.executemany("INSERT OR IGNORE INTO locations (locate_no,name,details) VALUES (?,?,?)", locations)
 
@@ -134,6 +271,47 @@ def sync_equipment_master_links(conn):
             "UPDATE equipment SET category_id=COALESCE(category_id,?), group_id=COALESCE(group_id,?), location_id=COALESCE(location_id,?) WHERE id=?",
             (category["id"] if category else None, group["id"] if group else None, location["id"] if location else None, item["id"]),
         )
+
+
+def sync_opening_stock_balances(conn):
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO stock_balances
+            (equipment_id, location_id, source_type, lot_reference, quantity)
+        SELECT e.id, e.location_id, 'opening_balance', 'OPENING', e.quantity
+        FROM equipment e
+        WHERE e.location_id IS NOT NULL AND e.quantity > 0
+          AND NOT EXISTS (SELECT 1 FROM stock_balances sb WHERE sb.equipment_id=e.id)
+        """
+    )
+
+
+def adjust_legacy_stock_balance(conn, equipment_id, delta, source_type, lot_reference):
+    item = conn.execute("SELECT location_id FROM equipment WHERE id=?", (equipment_id,)).fetchone()
+    if not item or not item["location_id"]:
+        raise ValueError("Equipment requires a default location")
+    if delta >= 0:
+        conn.execute(
+            """INSERT INTO stock_balances (equipment_id,location_id,source_type,lot_reference,quantity)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(equipment_id,location_id,source_type,lot_reference)
+               DO UPDATE SET quantity=quantity+excluded.quantity,updated_at=CURRENT_TIMESTAMP""",
+            (equipment_id, item["location_id"], source_type, lot_reference, delta),
+        )
+        return
+    remaining = -delta
+    balances = conn.execute(
+        "SELECT id,quantity FROM stock_balances WHERE equipment_id=? AND quantity>0 ORDER BY created_at,id",
+        (equipment_id,),
+    ).fetchall()
+    if sum(row["quantity"] for row in balances) < remaining:
+        raise ValueError("Not enough allocated quantity in store")
+    for balance in balances:
+        used = min(remaining, balance["quantity"])
+        conn.execute("UPDATE stock_balances SET quantity=quantity-?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (used, balance["id"]))
+        remaining -= used
+        if not remaining:
+            break
 
 
 def init_db():
@@ -278,6 +456,7 @@ def init_db():
                 "INSERT INTO users (username,password_hash,full_name,role) VALUES (?,?,?,?)",
                 [(u, hash_password(p), n, r) for u, p, n, r in seed_users],
             )
+        sync_user_roles(conn)
         if conn.execute("SELECT COUNT(*) FROM equipment").fetchone()[0] == 0:
             seed_equipment = [
                 ("VTCC-RDO-001", "Handheld Radio", "Communication", "Rack A1", 12, 4, 20, "set"),
@@ -295,6 +474,7 @@ def init_db():
                 seed_equipment,
             )
         sync_equipment_master_links(conn)
+        sync_opening_stock_balances(conn)
 
 
 def sign_payload(payload):
@@ -336,7 +516,10 @@ def log_activity(conn, user_id, action, entity_type, entity_id=None, details="")
 
 
 def notify_role(conn, role, order_id, message):
-    for user in conn.execute("SELECT id FROM users WHERE role=? AND active=1", (role,)).fetchall():
+    for user in conn.execute(
+        """SELECT DISTINCT u.id FROM users u JOIN user_roles ur ON ur.user_id=u.id
+           JOIN roles r ON r.id=ur.role_id WHERE r.role_key=? AND u.active=1""", (role,)
+    ).fetchall():
         conn.execute("INSERT INTO notifications (user_id,order_id,message) VALUES (?,?,?)", (user["id"], order_id, message))
 
 
@@ -397,10 +580,12 @@ class Handler(BaseHTTPRequestHandler):
         payload = verify_token(morsel.value)
         if not payload:
             return None
-        return one("SELECT id, username, full_name, role, active FROM users WHERE id=? AND active=1", (payload["uid"],))
+        with db() as conn:
+            user = conn.execute("SELECT id,username,full_name,role,active FROM users WHERE id=? AND active=1", (payload["uid"],)).fetchone()
+            return add_roles(conn, user)
 
     def can(self, user, permission):
-        allowed = ROLE_PERMISSIONS.get(user["role"], set())
+        allowed = set().union(*(ROLE_PERMISSIONS.get(role, set()) for role in user.get("roles", [user["role"]])))
         return "all" in allowed or permission in allowed
 
     def require(self, permission):
@@ -433,10 +618,17 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/api/master/"): return self.master_item(method, path.rsplit("/", 1)[-1])
             if path == "/api/equipment" and method == "GET": return self.list_equipment(query)
             if path == "/api/equipment" and method == "POST": return self.create_equipment()
+            if path == "/api/stock-movements" and method == "GET": return self.list_stock_movements(query)
+            if path == "/api/stock-movements" and method == "POST": return self.create_stock_movement()
+            if path == "/api/stock-balances" and method == "GET": return self.list_stock_balances(query)
+            if path == "/api/stock-proposals" and method == "GET": return self.list_stock_proposals()
+            if path.startswith("/api/stock-proposals/") and method == "PUT": return self.stock_proposal_action(path)
+            if path == "/api/returned-goods" and method == "GET": return self.list_returned_goods()
+            if path.startswith("/api/returned-goods/") and method == "PUT": return self.returned_goods_action(path)
             if path.startswith("/api/equipment/"): return self.equipment_item(method, path.rsplit("/", 1)[-1])
             if path == "/api/orders" and method == "GET": return self.list_orders(query)
             if path == "/api/orders" and method == "POST": return self.create_order()
-            if path.startswith("/api/orders/") and method == "PUT": return self.order_action(path)
+            if path.startswith("/api/orders/") and method in ("PUT", "DELETE"): return self.order_action(path, method)
             if path == "/api/requests" and method == "GET": return self.list_orders({"type": ["request"]})
             if path == "/api/requests" and method == "POST": return self.create_legacy_request()
             if path.startswith("/api/requests/") and method == "PUT": return self.legacy_decide(path.rsplit("/", 1)[-1])
@@ -459,7 +651,9 @@ class Handler(BaseHTTPRequestHandler):
         if not user or not user["active"] or not verify_password(data.get("password", ""), user["password_hash"]):
             return self.json({"error": "Invalid username or password"}, 401)
         token = sign_payload({"uid": user["id"], "exp": time.time() + 60 * 60 * 10})
-        safe_user = {k: user[k] for k in ("id", "username", "full_name", "role")}
+        with db() as conn:
+            safe_user = add_roles(conn, user)
+        safe_user = {k: safe_user[k] for k in ("id", "username", "full_name", "role", "roles")}
         self.json({"user": safe_user}, headers={"Set-Cookie": f"vtcc_session={token}; HttpOnly; Path=/; SameSite=Lax"})
 
     def dashboard(self):
@@ -469,8 +663,8 @@ class Handler(BaseHTTPRequestHandler):
             "total_items": one("SELECT COUNT(*) count FROM equipment")["count"],
             "low_stock": rows("SELECT * FROM equipment_view WHERE quantity < minimum_qty ORDER BY quantity ASC"),
             "over_stock": rows("SELECT * FROM equipment_view WHERE maximum_qty > 0 AND quantity > maximum_qty ORDER BY quantity DESC"),
-            "pending_requests": one("SELECT COUNT(*) count FROM orders WHERE order_type='request' AND status IN ('pending','acknowledged','approved')")["count"],
-            "pending_returns": one("SELECT COUNT(*) count FROM orders WHERE order_type='return' AND status IN ('pending','acknowledged','accepted')")["count"],
+            "pending_requests": one("SELECT COUNT(*) count FROM orders WHERE order_type='request' AND status IN ('pending','pending_manager_approval','manager_approved')")["count"],
+            "pending_returns": one("SELECT COUNT(*) count FROM orders WHERE order_type='return' AND status IN ('pending','pending_manager_acceptance','manager_accepted','return_delivered','returned_goods')")["count"],
             "unread_notifications": one("SELECT COUNT(*) count FROM notifications WHERE user_id=? AND read_at IS NULL", (user["id"],))["count"],
             "recent_movements": rows(
                 """
@@ -560,7 +754,7 @@ class Handler(BaseHTTPRequestHandler):
                     conn.execute(
                         f"SELECT 1 FROM {ref_table} WHERE {ref_col}=? LIMIT 1", (item_id,)
                     ).fetchone()
-                    for ref_table, ref_col in references
+                    for ref_table, ref_col in transaction_references
                 )
                 if referenced:
                     return self.json(
@@ -613,7 +807,7 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("Category and location are required")
         return (
             data["equipment_no"].strip(), data["name"].strip(), category["name"], location["name"],
-            int(data.get("quantity", 0)), int(data.get("minimum_qty", 0)), int(data.get("maximum_qty", 0)),
+            int(data.get("minimum_qty", 0)), int(data.get("maximum_qty", 0)),
             data.get("unit", "pcs").strip(), data.get("status", "available"), data.get("notes", ""),
             category_id, group_id, location_id,
         )
@@ -648,7 +842,7 @@ class Handler(BaseHTTPRequestHandler):
                 """
                 INSERT INTO equipment
                     (equipment_no,name,category,location,quantity,minimum_qty,maximum_qty,unit,status,notes,category_id,group_id,location_id)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,0,?,?,?,?,?,?,?,?)
                 """, values
             )
             log_activity(conn, user["id"], "create", "equipment", cur.lastrowid, data.get("name", ""))
@@ -681,12 +875,376 @@ class Handler(BaseHTTPRequestHandler):
         with db() as conn:
             conn.execute(
                 """
-                UPDATE equipment SET equipment_no=?, name=?, category=?, location=?, quantity=?, minimum_qty=?, maximum_qty=?,
+                UPDATE equipment SET equipment_no=?, name=?, category=?, location=?, minimum_qty=?, maximum_qty=?,
                     unit=?, status=?, notes=?, category_id=?, group_id=?, location_id=?, updated_at=CURRENT_TIMESTAMP WHERE id=?
                 """, values + (equipment_id,)
             )
-            conn.execute("INSERT INTO stock_movements (equipment_id,user_id,movement_type,quantity,reference) VALUES (?,?,?,?,?)", (equipment_id, user["id"], "store_check", int(data.get("quantity", 0)), "Store stock check/update"))
             log_activity(conn, user["id"], "update", "equipment", equipment_id, data.get("name", ""))
+        self.json({"ok": True})
+
+    def list_stock_movements(self, query):
+        user = self.require("inventory:read")
+        if not user: return
+        direction = (query.get("direction", [""])[0] or "").strip()
+        source_type = (query.get("source_type", [""])[0] or "").strip()
+        equipment_id = int((query.get("equipment_id", ["0"])[0] or 0))
+        where, args = [], []
+        if direction == "incoming":
+            where.append("sm.quantity > 0")
+        elif direction == "outgoing":
+            where.append("sm.quantity < 0")
+        if source_type:
+            legacy_types = {
+                "procurement": ("purchase",),
+                "return_equipment": ("return_stock", "return_received"),
+                "checking_store": ("store_check",),
+                "delivered_requester": ("request_delivery",),
+            }.get(source_type, ())
+            placeholders = ",".join("?" for _ in legacy_types)
+            clause = "sm.source_type=?"
+            if placeholders:
+                clause += f" OR (COALESCE(sm.source_type,'')='' AND sm.movement_type IN ({placeholders}))"
+            where.append(f"({clause})")
+            args.extend((source_type, *legacy_types))
+        if equipment_id:
+            where.append("sm.equipment_id=?")
+            args.append(equipment_id)
+        condition = "WHERE " + " AND ".join(where) if where else ""
+        data = rows(
+            f"""
+            SELECT sm.*, e.equipment_no, e.name, e.unit, u.full_name,
+                   l.locate_no, l.name location_name
+            FROM stock_movements sm
+            JOIN equipment e ON e.id=sm.equipment_id
+            JOIN users u ON u.id=sm.user_id
+            LEFT JOIN locations l ON l.id=sm.location_id
+            {condition}
+            ORDER BY sm.created_at DESC, sm.id DESC LIMIT 250
+            """, args
+        )
+        self.json({"movements": data})
+
+    def list_stock_balances(self, query):
+        user = self.require("inventory:read")
+        if not user: return
+        equipment_id = int((query.get("equipment_id", ["0"])[0] or 0))
+        where, args = "WHERE sb.quantity > 0", []
+        if equipment_id:
+            where += " AND sb.equipment_id=?"
+            args.append(equipment_id)
+        data = rows(
+            f"""
+            SELECT sb.*, e.equipment_no, e.name equipment_name, e.unit,
+                   l.locate_no, l.name location_name
+            FROM stock_balances sb
+            JOIN equipment e ON e.id=sb.equipment_id
+            JOIN locations l ON l.id=sb.location_id
+            {where}
+            ORDER BY e.equipment_no, l.locate_no, sb.created_at, sb.id
+            """, args
+        )
+        self.json({"balances": data})
+
+    def create_stock_movement(self):
+        user = self.require("movement:propose")
+        if not user: return
+        data = self.body()
+        source_type = data.get("source_type", "").strip()
+        if source_type not in {"procurement", "return_equipment", "checking_store", "delivered_requester"}:
+            raise ValueError("Unknown stock movement source")
+        equipment_id = int(data.get("equipment_id") or 0)
+        location_id = int(data.get("location_id") or 0)
+        if not equipment_id or not location_id:
+            raise ValueError("Equipment and location are required")
+        with db() as conn:
+            cur = conn.execute(
+                """INSERT INTO stock_proposals
+                   (proposer_id,source_type,equipment_id,location_id,allocation_id,quantity,actual_quantity,
+                    expected_direction,lot_reference,reference)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (user["id"], source_type, equipment_id, location_id, int(data.get("allocation_id") or 0) or None,
+                 int(data.get("quantity") or 0) or None,
+                 int(data["actual_quantity"]) if str(data.get("actual_quantity", "")).strip() else None,
+                 data.get("expected_direction", ""), data.get("lot_reference", "").strip(),
+                 data.get("reference", "").strip()),
+            )
+            proposal_id = cur.lastrowid
+            notify_role(conn, "store_manager", None, f"Stock proposal #{proposal_id} is waiting for approval")
+            log_activity(conn, user["id"], "propose", "stock_proposal", proposal_id, source_type)
+        self.json({"id": proposal_id, "status": "pending_manager"}, 201)
+
+    def post_stock_movement(self, data, user, respond=True):
+        source_type = data.get("source_type", "").strip()
+        allowed = {"procurement": 1, "return_equipment": 1, "checking_store": 0, "delivered_requester": -1}
+        if source_type not in allowed:
+            raise ValueError("Unknown stock movement source")
+        equipment_id = int(data.get("equipment_id") or 0)
+        location_id = int(data.get("location_id") or 0)
+        reference = data.get("reference", "").strip()
+        lot_reference = data.get("lot_reference", "").strip()
+        with db() as conn:
+            item = conn.execute("SELECT id, name, quantity FROM equipment WHERE id=?", (equipment_id,)).fetchone()
+            location = conn.execute("SELECT id FROM locations WHERE id=? AND active=1", (location_id,)).fetchone()
+            if not item:
+                raise ValueError("Equipment not found")
+            if not location:
+                raise ValueError("An active storage location is required")
+            system_quantity = item["quantity"]
+            location_quantity = conn.execute(
+                "SELECT COALESCE(SUM(quantity),0) total FROM stock_balances WHERE equipment_id=? AND location_id=?",
+                (equipment_id, location_id),
+            ).fetchone()["total"]
+            allocation_id = None
+            if source_type == "checking_store":
+                actual_quantity = int(data.get("actual_quantity", -1))
+                if actual_quantity < 0:
+                    raise ValueError("Actual quantity must be zero or greater")
+                delta = actual_quantity - location_quantity
+                expected_direction = data.get("expected_direction", "").strip()
+                if expected_direction == "incoming" and delta < 0:
+                    raise ValueError("This count is an outgoing adjustment; use Outgoing equipment - From Checking Store")
+                if expected_direction == "outgoing" and delta > 0:
+                    raise ValueError("This count is an incoming adjustment; use Incoming equipment - From Checking Store")
+                lot_reference = lot_reference or reference or f"CHECK-{int(time.time())}"
+                if delta > 0:
+                    conn.execute(
+                        """INSERT INTO stock_balances (equipment_id,location_id,source_type,lot_reference,quantity)
+                           VALUES (?,?,?,?,?)
+                           ON CONFLICT(equipment_id,location_id,source_type,lot_reference)
+                           DO UPDATE SET quantity=quantity+excluded.quantity, updated_at=CURRENT_TIMESTAMP""",
+                        (equipment_id, location_id, source_type, lot_reference, delta),
+                    )
+                    allocation_id = conn.execute(
+                        "SELECT id FROM stock_balances WHERE equipment_id=? AND location_id=? AND source_type=? AND lot_reference=?",
+                        (equipment_id, location_id, source_type, lot_reference),
+                    ).fetchone()["id"]
+                elif delta < 0:
+                    remaining = -delta
+                    for balance in conn.execute(
+                        "SELECT id,quantity FROM stock_balances WHERE equipment_id=? AND location_id=? AND quantity>0 ORDER BY created_at,id",
+                        (equipment_id, location_id),
+                    ).fetchall():
+                        used = min(remaining, balance["quantity"])
+                        conn.execute("UPDATE stock_balances SET quantity=quantity-?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (used, balance["id"]))
+                        remaining -= used
+                        if not remaining: break
+                movement_type = "checking_store"
+                reference = reference or "Physical count at storage location"
+            elif source_type == "delivered_requester":
+                allocation_id = int(data.get("allocation_id") or 0)
+                allocation = conn.execute(
+                    "SELECT * FROM stock_balances WHERE id=? AND equipment_id=? AND location_id=?",
+                    (allocation_id, equipment_id, location_id),
+                ).fetchone()
+                quantity = int(data.get("quantity") or 0)
+                if not allocation or quantity <= 0:
+                    raise ValueError("Select a stored lot and a quantity greater than zero")
+                if quantity > allocation["quantity"]:
+                    raise ValueError(f"Only {allocation['quantity']} available in the selected lot")
+                delta = -quantity
+                lot_reference = allocation["lot_reference"]
+                conn.execute("UPDATE stock_balances SET quantity=quantity-?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (quantity, allocation_id))
+                movement_type = source_type
+            else:
+                quantity = int(data.get("quantity") or 0)
+                if quantity <= 0:
+                    raise ValueError("Quantity must be greater than zero")
+                if source_type == "procurement" and not lot_reference:
+                    raise ValueError("Procurement lot is required")
+                lot_reference = lot_reference or reference or f"{source_type.upper()}-{int(time.time())}"
+                delta = quantity
+                conn.execute(
+                    """INSERT INTO stock_balances (equipment_id,location_id,source_type,lot_reference,quantity)
+                       VALUES (?,?,?,?,?)
+                       ON CONFLICT(equipment_id,location_id,source_type,lot_reference)
+                       DO UPDATE SET quantity=quantity+excluded.quantity, updated_at=CURRENT_TIMESTAMP""",
+                    (equipment_id, location_id, source_type, lot_reference, quantity),
+                )
+                allocation_id = conn.execute(
+                    "SELECT id FROM stock_balances WHERE equipment_id=? AND location_id=? AND source_type=? AND lot_reference=?",
+                    (equipment_id, location_id, source_type, lot_reference),
+                ).fetchone()["id"]
+                movement_type = source_type
+            balance_after = system_quantity + delta
+            location_balance_after = location_quantity + delta
+            if balance_after < 0 or location_balance_after < 0:
+                raise ValueError("Insufficient stock at the selected storage location")
+            conn.execute("UPDATE equipment SET quantity=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (balance_after, equipment_id))
+            cur = conn.execute(
+                """INSERT INTO stock_movements
+                   (equipment_id,user_id,movement_type,quantity,reference,source_type,system_quantity,balance_after,
+                    location_id,lot_reference,location_quantity,location_balance_after,allocation_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (equipment_id, user["id"], movement_type, delta, reference, source_type, system_quantity, balance_after,
+                 location_id, lot_reference, location_quantity, location_balance_after, allocation_id),
+            )
+            log_activity(conn, user["id"], "stock_movement", "equipment", equipment_id,
+                         f"{source_type}: {delta:+d}; location {location_id}; lot {lot_reference}; balance {balance_after}")
+        result = {"id": cur.lastrowid, "difference": delta, "balance_after": balance_after,
+                  "location_balance_after": location_balance_after}
+        if respond:
+            self.json(result, 201)
+        return result
+
+    def list_stock_proposals(self):
+        user = self.require("orders:read")
+        if not user: return
+        data = rows(
+            """SELECT sp.*, e.equipment_no, e.name equipment_name, e.unit,
+                      l.locate_no, l.name location_name, u.full_name proposer_name,
+                      r.full_name reviewer_name
+               FROM stock_proposals sp
+               JOIN equipment e ON e.id=sp.equipment_id
+               JOIN locations l ON l.id=sp.location_id
+               JOIN users u ON u.id=sp.proposer_id
+               LEFT JOIN users r ON r.id=sp.reviewer_id
+               ORDER BY CASE sp.status WHEN 'pending_manager' THEN 0 ELSE 1 END,
+                        sp.created_at DESC"""
+        )
+        self.json({"proposals": data})
+
+    def stock_proposal_action(self, path):
+        user = self.require("movement:approve")
+        if not user: return
+        parts = path.strip("/").split("/")
+        proposal_id = int(parts[2])
+        action = parts[3] if len(parts) > 3 else ""
+        if action not in ("approve", "reject"):
+            return self.json({"error": "Unknown proposal action"}, 404)
+        proposal = one("SELECT * FROM stock_proposals WHERE id=?", (proposal_id,))
+        if not proposal:
+            return self.json({"error": "Stock proposal not found"}, 404)
+        if proposal["status"] != "pending_manager":
+            return self.json({"error": "This proposal has already been decided"}, 409)
+        payload = self.body()
+        comment = payload.get("comment", "").strip()
+        if action == "reject":
+            with db() as conn:
+                conn.execute(
+                    """UPDATE stock_proposals SET status='rejected',reviewer_id=?,
+                       review_comment=?,decided_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (user["id"], comment, proposal_id),
+                )
+                notify_user(conn, proposal["proposer_id"], None, f"Stock proposal #{proposal_id} was rejected")
+                log_activity(conn, user["id"], "reject", "stock_proposal", proposal_id, comment)
+            return self.json({"ok": True, "status": "rejected"})
+        data = {
+            "source_type": proposal["source_type"],
+            "equipment_id": proposal["equipment_id"],
+            "location_id": proposal["location_id"],
+            "allocation_id": proposal["allocation_id"],
+            "quantity": proposal["quantity"],
+            "actual_quantity": proposal["actual_quantity"],
+            "expected_direction": proposal["expected_direction"],
+            "lot_reference": proposal["lot_reference"],
+            "reference": proposal["reference"],
+        }
+        result = self.post_stock_movement(data, user, respond=False)
+        with db() as conn:
+            conn.execute(
+                """UPDATE stock_proposals SET status='approved_posted',reviewer_id=?,
+                   review_comment=?,decided_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (user["id"], comment, proposal_id),
+            )
+            notify_user(conn, proposal["proposer_id"], None, f"Stock proposal #{proposal_id} was approved and posted")
+            log_activity(conn, user["id"], "approve_and_post", "stock_proposal", proposal_id, comment)
+        self.json({"ok": True, "status": "approved_posted", "posting": result})
+
+    def list_returned_goods(self):
+        user = self.require("orders:read")
+        if not user: return
+        data = rows(
+            """SELECT rg.*, e.equipment_no, e.name equipment_name, e.unit,
+                      l.locate_no, l.name location_name, u.full_name received_by_name,
+                      i.full_name inspected_by_name, d.full_name decided_by_name
+               FROM returned_goods rg
+               JOIN equipment e ON e.id=rg.equipment_id
+               LEFT JOIN locations l ON l.id=rg.receiving_location_id
+               JOIN users u ON u.id=rg.received_by
+               LEFT JOIN users i ON i.id=rg.inspected_by
+               LEFT JOIN users d ON d.id=rg.decided_by
+               ORDER BY CASE rg.status
+                 WHEN 'pending_manager_restock' THEN 0
+                 WHEN 'pending_manager_discontinue' THEN 0
+                 WHEN 'awaiting_inspection' THEN 1 ELSE 2 END,
+                 rg.received_at DESC"""
+        )
+        self.json({"returned_goods": data})
+
+    def returned_goods_action(self, path):
+        user = self.require(None)
+        if not user: return
+        parts = path.strip("/").split("/")
+        goods_id = int(parts[2])
+        action = parts[3] if len(parts) > 3 else ""
+        item = one("SELECT * FROM returned_goods WHERE id=?", (goods_id,))
+        if not item:
+            return self.json({"error": "Returned goods item not found"}, 404)
+        data = self.body()
+        with db() as conn:
+            if action == "inspect":
+                if not self.can(user, "return:inspect"):
+                    return self.json({"error": "Permission denied"}, 403)
+                if item["status"] != "awaiting_inspection":
+                    return self.json({"error": "This item is not awaiting inspection"}, 409)
+                disposition = data.get("disposition")
+                if disposition not in ("restock", "discontinue"):
+                    raise ValueError("Disposition must be restock or discontinue")
+                status = f"pending_manager_{disposition}"
+                conn.execute(
+                    """UPDATE returned_goods SET status=?,disposition=?,inspection_note=?,
+                       inspected_by=?,inspected_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (status, disposition, data.get("comment", ""), user["id"], goods_id),
+                )
+                notify_role(conn, "store_manager", item["order_id"], f"Returned goods #{goods_id} needs final decision")
+                log_activity(conn, user["id"], "inspect", "returned_goods", goods_id, disposition)
+            elif action in ("approve", "reject"):
+                if not self.can(user, "return:final_approve"):
+                    return self.json({"error": "Permission denied"}, 403)
+                if item["status"] not in ("pending_manager_restock", "pending_manager_discontinue"):
+                    return self.json({"error": "This item is not awaiting manager decision"}, 409)
+                if action == "reject":
+                    conn.execute(
+                        """UPDATE returned_goods SET status='awaiting_inspection',manager_comment=?,
+                           decided_by=?,decided_at=CURRENT_TIMESTAMP WHERE id=?""",
+                        (data.get("comment", ""), user["id"], goods_id),
+                    )
+                elif item["disposition"] == "restock":
+                    equipment = conn.execute("SELECT location_id,quantity FROM equipment WHERE id=?", (item["equipment_id"],)).fetchone()
+                    adjust_legacy_stock_balance(conn, item["equipment_id"], item["quantity"], "return_equipment", f"RETURN-{item['order_id']}")
+                    conn.execute("UPDATE equipment SET quantity=quantity+?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (item["quantity"], item["equipment_id"]))
+                    conn.execute(
+                        """INSERT INTO stock_movements
+                           (equipment_id,user_id,movement_type,quantity,reference,source_type,system_quantity,
+                            balance_after,location_id,lot_reference)
+                           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                        (item["equipment_id"], user["id"], "return_to_stock", item["quantity"],
+                         f"Return order #{item['order_id']}", "return_equipment", equipment["quantity"],
+                         equipment["quantity"] + item["quantity"], equipment["location_id"], f"RETURN-{item['order_id']}"),
+                    )
+                    conn.execute(
+                        """UPDATE returned_goods SET status='in_stock',manager_comment=?,
+                           decided_by=?,decided_at=CURRENT_TIMESTAMP WHERE id=?""",
+                        (data.get("comment", ""), user["id"], goods_id),
+                    )
+                else:
+                    discontinued = conn.execute("SELECT id FROM locations WHERE locate_no='AREA-DISC'").fetchone()
+                    conn.execute(
+                        """UPDATE returned_goods SET status='discontinued',receiving_location_id=?,
+                           manager_comment=?,decided_by=?,decided_at=CURRENT_TIMESTAMP WHERE id=?""",
+                        (discontinued["id"] if discontinued else item["receiving_location_id"],
+                         data.get("comment", ""), user["id"], goods_id),
+                    )
+                if action == "approve":
+                    open_items = conn.execute(
+                        "SELECT COUNT(*) FROM returned_goods WHERE order_id=? AND status NOT IN ('in_stock','discontinued')",
+                        (item["order_id"],),
+                    ).fetchone()[0]
+                    if not open_items:
+                        conn.execute("UPDATE orders SET status='completed' WHERE id=?", (item["order_id"],))
+                log_activity(conn, user["id"], action, "returned_goods", goods_id, data.get("comment", ""))
+            else:
+                return self.json({"error": "Unknown returned goods action"}, 404)
         self.json({"ok": True})
 
     def list_orders(self, query):
@@ -698,9 +1256,6 @@ class Handler(BaseHTTPRequestHandler):
         if order_type:
             where.append("o.order_type=?")
             args.append(order_type)
-        if user["role"] == "front_end":
-            where.append("o.requester_id=?")
-            args.append(user["id"])
         condition = "WHERE " + " AND ".join(where) if where else ""
         orders = rows(
             f"""
@@ -741,84 +1296,133 @@ class Handler(BaseHTTPRequestHandler):
                 qty = int(item["quantity"])
                 conn.execute("INSERT INTO order_items (order_id,equipment_id,quantity,return_action) VALUES (?,?,?,?)", (order_id, equipment_id, qty, item.get("return_action", "")))
                 if order_type == "purchase":
+                    adjust_legacy_stock_balance(conn, equipment_id, qty, "procurement", f"PURCHASE-{order_id}")
                     conn.execute("UPDATE equipment SET quantity=quantity+?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (qty, equipment_id))
                     conn.execute("INSERT INTO stock_movements (equipment_id,user_id,movement_type,quantity,reference) VALUES (?,?,?,?,?)", (equipment_id, user["id"], "purchase", qty, f"Purchase order #{order_id}: {data.get('file_reference', '')}"))
             if order_type in ("request", "return"):
                 notify_role(conn, "store", order_id, f"New {order_type} order #{order_id} is pending acknowledgement")
+                notify_role(conn, "store_manager", order_id, f"New {order_type} order #{order_id} is pending acknowledgement")
             log_activity(conn, user["id"], "create", f"{order_type}_order", order_id, data.get("purpose", ""))
         self.json({"id": order_id}, 201)
 
-    def order_action(self, path):
+    def order_action(self, path, method="PUT"):
         parts = path.strip("/").split("/")
         order_id = int(parts[2])
-        action = parts[3] if len(parts) > 3 else ""
+        action = parts[3] if len(parts) > 3 else ("delete" if method == "DELETE" else "")
         user = self.require(None)
         if not user: return
         order = one("SELECT * FROM orders WHERE id=?", (order_id,))
         if not order: return self.json({"error": "Order not found"}, 404)
         data = self.body()
         with db() as conn:
-            if action == "ack":
-                if order["order_type"] == "request" and not self.can(user, "request:manage"): return self.json({"error": "Permission denied"}, 403)
-                if order["order_type"] == "return" and not self.can(user, "return:manage"): return self.json({"error": "Permission denied"}, 403)
-                conn.execute("UPDATE orders SET status=CASE WHEN status='pending' THEN 'acknowledged' ELSE status END, authorizer_id=?, acknowledged_at=CURRENT_TIMESTAMP WHERE id=?", (user["id"], order_id))
-                notify_user(conn, order["requester_id"], order_id, f"Your {order['order_type']} order #{order_id} was acknowledged")
-                log_activity(conn, user["id"], "acknowledge", "order", order_id)
-            elif action == "decide":
-                decision = data.get("decision")
-                comment = data.get("comment", "")
-                if order["order_type"] == "request":
-                    if not self.can(user, "request:manage"): return self.json({"error": "Permission denied"}, 403)
-                    if decision not in ("approved", "rejected"): raise ValueError("Request decision must be approved or rejected")
-                elif order["order_type"] == "return":
-                    if not self.can(user, "return:manage"): return self.json({"error": "Permission denied"}, 403)
-                    if decision not in ("accepted", "cancelled"): raise ValueError("Return decision must be accepted or cancelled")
+            if action in ("edit", "delete"):
+                if user["id"] != order["requester_id"]:
+                    return self.json({"error": "Only the owner can edit or delete this order"}, 403)
+                if order["status"] != "pending":
+                    return self.json({"error": "Only pending orders can be changed"}, 409)
+                if action == "delete":
+                    conn.execute("DELETE FROM notifications WHERE order_id=?", (order_id,))
+                    conn.execute("DELETE FROM orders WHERE id=?", (order_id,))
+                    log_activity(conn, user["id"], "delete", "order", order_id)
                 else:
-                    raise ValueError("Purchase orders cannot use this decision flow")
-                if decision == "accepted":
-                    for item in conn.execute("SELECT * FROM order_items WHERE order_id=?", (order_id,)).fetchall():
-                        conn.execute("UPDATE equipment SET return_quantity=return_quantity+?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (item["quantity"], item["equipment_id"]))
-                        conn.execute("INSERT INTO stock_movements (equipment_id,user_id,movement_type,quantity,reference) VALUES (?,?,?,?,?)", (item["equipment_id"], user["id"], "return_stock", item["quantity"], f"Return order #{order_id}"))
-                conn.execute("UPDATE orders SET status=?, decider_id=?, decided_at=CURRENT_TIMESTAMP, comment=? WHERE id=?", (decision, user["id"], comment, order_id))
-                notify_user(conn, order["requester_id"], order_id, f"Your {order['order_type']} order #{order_id} was {decision}")
-                log_activity(conn, user["id"], "decide", "order", order_id, f"{decision}: {comment}")
+                    items = [i for i in data.get("items", []) if i.get("equipment_id") and int(i.get("quantity", 0)) > 0]
+                    if not items:
+                        raise ValueError("At least one equipment item is required")
+                    conn.execute("UPDATE orders SET purpose=?,file_reference=? WHERE id=?", (data.get("purpose", ""), data.get("file_reference", ""), order_id))
+                    conn.execute("DELETE FROM order_items WHERE order_id=?", (order_id,))
+                    conn.executemany(
+                        "INSERT INTO order_items (order_id,equipment_id,quantity) VALUES (?,?,?)",
+                        [(order_id, int(item["equipment_id"]), int(item["quantity"])) for item in items],
+                    )
+                    log_activity(conn, user["id"], "update", "order", order_id)
+            elif action in ("ack", "prepare"):
+                permission = "request:prepare" if order["order_type"] == "request" else "return:receive"
+                if not self.can(user, permission):
+                    return self.json({"error": "Only a Store Officer can prepare this transaction"}, 403)
+                if order["status"] != "pending":
+                    return self.json({"error": "Only pending transactions can be prepared"}, 409)
+                next_status = "pending_manager_approval" if order["order_type"] == "request" else "pending_manager_acceptance"
+                conn.execute(
+                    """UPDATE orders SET status=?,authorizer_id=?,acknowledged_at=CURRENT_TIMESTAMP
+                       WHERE id=?""", (next_status, user["id"], order_id)
+                )
+                notify_role(conn, "store_manager", order_id, f"{order['order_type'].title()} order #{order_id} needs final approval")
+                notify_user(conn, order["requester_id"], order_id, f"Store Officer prepared your {order['order_type']} order #{order_id}")
+                log_activity(conn, user["id"], "prepare", "order", order_id, next_status)
+            elif action == "decide":
+                permission = "request:final_approve" if order["order_type"] == "request" else "return:final_approve"
+                if not self.can(user, permission):
+                    return self.json({"error": "Only a Store Manager can make the final decision"}, 403)
+                expected = "pending_manager_approval" if order["order_type"] == "request" else "pending_manager_acceptance"
+                if order["status"] != expected:
+                    return self.json({"error": "The Store Officer must prepare this transaction first"}, 409)
+                decision = data.get("decision")
+                if order["order_type"] == "request":
+                    statuses = {"approved": "manager_approved", "rejected": "rejected"}
+                else:
+                    statuses = {"accepted": "manager_accepted", "cancelled": "cancelled"}
+                if decision not in statuses:
+                    raise ValueError("Invalid manager decision")
+                status = statuses[decision]
+                conn.execute(
+                    """UPDATE orders SET status=?,decider_id=?,decided_at=CURRENT_TIMESTAMP,comment=?
+                       WHERE id=?""", (status, user["id"], data.get("comment", ""), order_id)
+                )
+                notify_user(conn, order["requester_id"], order_id, f"Your {order['order_type']} order #{order_id} is {status.replace('_', ' ')}")
+                notify_role(conn, "store", order_id, f"{order['order_type'].title()} order #{order_id} is {status.replace('_', ' ')}")
+                log_activity(conn, user["id"], "final_decision", "order", order_id, f"{status}: {data.get('comment', '')}")
             elif action == "store-deliver":
-                if not self.can(user, "request:manage"): return self.json({"error": "Permission denied"}, 403)
-                if order["order_type"] != "request" or order["status"] != "approved": raise ValueError("Only approved request orders can be delivered")
+                if not self.can(user, "request:prepare"):
+                    return self.json({"error": "Only a Store Officer can deliver items"}, 403)
+                if order["order_type"] != "request" or order["status"] != "manager_approved":
+                    raise ValueError("Only manager-approved requests can be delivered")
                 for item in conn.execute("SELECT * FROM order_items WHERE order_id=?", (order_id,)).fetchall():
                     stock = conn.execute("SELECT quantity FROM equipment WHERE id=?", (item["equipment_id"],)).fetchone()["quantity"]
-                    if stock < item["quantity"]: raise ValueError("Not enough quantity in store")
-                    conn.execute("UPDATE equipment SET quantity=quantity-?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (item["quantity"], item["equipment_id"]))
-                    conn.execute("INSERT INTO stock_movements (equipment_id,user_id,movement_type,quantity,reference) VALUES (?,?,?,?,?)", (item["equipment_id"], user["id"], "request_delivery", -item["quantity"], f"Request order #{order_id}"))
-                conn.execute("UPDATE orders SET status='delivered', store_delivered_at=CURRENT_TIMESTAMP WHERE id=?", (order_id,))
-                notify_user(conn, order["requester_id"], order_id, f"Request order #{order_id} was delivered by store")
+                    if stock < item["quantity"]:
+                        raise ValueError("Not enough quantity in store")
+                    adjust_legacy_stock_balance(conn, item["equipment_id"], -item["quantity"], "delivered_requester", f"REQUEST-{order_id}")
+                    conn.execute("UPDATE equipment SET quantity=quantity-?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (item["quantity"], item["equipment_id"]))
+                    conn.execute(
+                        "INSERT INTO stock_movements (equipment_id,user_id,movement_type,quantity,reference) VALUES (?,?,?,?,?)",
+                        (item["equipment_id"], user["id"], "request_delivery", -item["quantity"], f"Request order #{order_id}"),
+                    )
+                conn.execute("UPDATE orders SET status='delivered',store_delivered_at=CURRENT_TIMESTAMP WHERE id=?", (order_id,))
+                notify_user(conn, order["requester_id"], order_id, f"Request order #{order_id} is ready and was delivered")
                 log_activity(conn, user["id"], "deliver", "order", order_id)
             elif action == "requester-accept":
-                if user["id"] != order["requester_id"]: return self.json({"error": "Only the requester can accept delivered items"}, 403)
-                conn.execute("UPDATE orders SET status='completed', requester_accepted_at=CURRENT_TIMESTAMP WHERE id=?", (order_id,))
+                if user["id"] != order["requester_id"]:
+                    return self.json({"error": "Only the requester can accept delivered items"}, 403)
+                if order["status"] != "delivered":
+                    return self.json({"error": "This request has not been delivered"}, 409)
+                conn.execute("UPDATE orders SET status='completed',requester_accepted_at=CURRENT_TIMESTAMP WHERE id=?", (order_id,))
                 log_activity(conn, user["id"], "accept_delivery", "order", order_id)
             elif action == "returner-deliver":
-                if user["id"] != order["requester_id"]: return self.json({"error": "Only the returner can deliver return items"}, 403)
-                conn.execute("UPDATE orders SET status=CASE WHEN status='accepted' THEN 'return_delivered' ELSE status END, requester_delivered_at=CURRENT_TIMESTAMP WHERE id=?", (order_id,))
-                notify_role(conn, "store", order_id, f"Return order #{order_id} was delivered to store")
+                if user["id"] != order["requester_id"]:
+                    return self.json({"error": "Only the returner can deliver return items"}, 403)
+                if order["status"] != "manager_accepted":
+                    return self.json({"error": "This return has not been accepted by the Store Manager"}, 409)
+                conn.execute("UPDATE orders SET status='return_delivered',requester_delivered_at=CURRENT_TIMESTAMP WHERE id=?", (order_id,))
+                notify_role(conn, "store", order_id, f"Return order #{order_id} was delivered to the Returned Goods area")
                 log_activity(conn, user["id"], "deliver_return", "order", order_id)
             elif action == "store-receive":
-                if not self.can(user, "return:manage"): return self.json({"error": "Permission denied"}, 403)
-                final_action = data.get("return_action", "stock")
-                if final_action not in ("stock", "purge"): raise ValueError("Return action must be stock or purge")
+                if not self.can(user, "return:receive"):
+                    return self.json({"error": "Only a Store Officer can receive returned goods"}, 403)
+                if order["order_type"] != "return" or order["status"] != "return_delivered":
+                    return self.json({"error": "The returner has not delivered this order"}, 409)
+                returned_area = conn.execute("SELECT id FROM locations WHERE locate_no='AREA-RETURN'").fetchone()
+                if not returned_area:
+                    raise ValueError("Returned Goods location is not configured")
                 for item in conn.execute("SELECT * FROM order_items WHERE order_id=?", (order_id,)).fetchall():
-                    qty = item["quantity"]
-                    if final_action == "stock":
-                        conn.execute("UPDATE equipment SET quantity=quantity+?, return_quantity=MAX(return_quantity-?,0), updated_at=CURRENT_TIMESTAMP WHERE id=?", (qty, qty, item["equipment_id"]))
-                        movement = "return_to_stock"
-                    else:
-                        conn.execute("UPDATE equipment SET return_quantity=MAX(return_quantity-?,0), updated_at=CURRENT_TIMESTAMP WHERE id=?", (qty, item["equipment_id"]))
-                        movement = "return_purged"
-                    conn.execute("UPDATE order_items SET return_action=? WHERE id=?", (final_action, item["id"]))
-                    conn.execute("INSERT INTO stock_movements (equipment_id,user_id,movement_type,quantity,reference) VALUES (?,?,?,?,?)", (item["equipment_id"], user["id"], movement, qty if final_action == "stock" else 0, f"Return order #{order_id}"))
-                conn.execute("UPDATE orders SET status='completed', store_received_at=CURRENT_TIMESTAMP WHERE id=?", (order_id,))
-                notify_user(conn, order["requester_id"], order_id, f"Return order #{order_id} was received by store")
-                log_activity(conn, user["id"], "receive_return", "order", order_id, final_action)
+                    conn.execute(
+                        """INSERT OR IGNORE INTO returned_goods
+                           (order_id,order_item_id,equipment_id,quantity,receiving_location_id,received_by)
+                           VALUES (?,?,?,?,?,?)""",
+                        (order_id, item["id"], item["equipment_id"], item["quantity"], returned_area["id"], user["id"]),
+                    )
+                conn.execute("UPDATE orders SET status='returned_goods',store_received_at=CURRENT_TIMESTAMP WHERE id=?", (order_id,))
+                notify_role(conn, "store_manager", order_id, f"Return order #{order_id} was received into Returned Goods")
+                notify_user(conn, order["requester_id"], order_id, f"Return order #{order_id} was received by the store")
+                log_activity(conn, user["id"], "receive_return", "order", order_id, "returned_goods")
             else:
                 return self.json({"error": "Unknown order action"}, 404)
         self.json({"ok": True})
@@ -844,21 +1448,25 @@ class Handler(BaseHTTPRequestHandler):
         self.json({"notifications": data})
 
     def syslog(self):
-        user = self.require("all")
+        user = self.require("audit:read")
         if not user: return
         self.json({"syslog": rows("SELECT s.*, u.username, u.full_name FROM syslog s LEFT JOIN users u ON u.id=s.user_id ORDER BY s.created_at DESC LIMIT 200")})
 
     def list_users(self):
         user = self.require("all")
         if not user: return
-        self.json({"users": rows("SELECT id,username,full_name,role,active,created_at FROM users ORDER BY username")})
+        with db() as conn:
+            users = [add_roles(conn, row) for row in conn.execute("SELECT id,username,full_name,role,active,created_at FROM users ORDER BY username").fetchall()]
+        self.json({"users": users})
 
     def create_user(self):
         user = self.require("all")
         if not user: return
         data = self.body()
         with db() as conn:
-            cur = conn.execute("INSERT INTO users (username,password_hash,full_name,role,active) VALUES (?,?,?,?,?)", (data["username"], hash_password(data["password"]), data["full_name"], data["role"], int(data.get("active", 1))))
+            roles = data.get("roles") or [data.get("role")]
+            cur = conn.execute("INSERT INTO users (username,password_hash,full_name,role,active) VALUES (?,?,?,?,?)", (data["username"], hash_password(data["password"]), data["full_name"], roles[0], int(data.get("active", 1))))
+            set_user_roles(conn, cur.lastrowid, roles)
             log_activity(conn, user["id"], "create", "user", cur.lastrowid, data["username"])
         self.json({"id": cur.lastrowid}, 201)
 
@@ -876,22 +1484,30 @@ class Handler(BaseHTTPRequestHandler):
             if method == "DELETE":
                 if target_id == user["id"]:
                     return self.json({"error": "You cannot delete your own user account."}, 409)
-                references = (
+                transaction_references = (
                     ("orders", "requester_id"), ("orders", "authorizer_id"), ("orders", "decider_id"),
                     ("requests", "requester_id"), ("requests", "approver_id"),
-                    ("stock_movements", "user_id"), ("notifications", "user_id"), ("syslog", "user_id"),
+                    ("stock_movements", "user_id"),
                 )
                 referenced = any(
                     conn.execute(
                         f"SELECT 1 FROM {ref_table} WHERE {ref_col}=? LIMIT 1", (target_id,)
                     ).fetchone()
-                    for ref_table, ref_col in references
+                    for ref_table, ref_col in transaction_references
                 )
                 if referenced:
                     return self.json(
-                        {"error": "This user is referenced and cannot be deleted. Deactivate the user instead."},
+                        {"error": "This user is referenced by a store transaction and cannot be deleted. Deactivate the user instead."},
                         409,
                     )
+                conn.execute("DELETE FROM notifications WHERE user_id=?", (target_id,))
+                deleted_user = "Deleted user: {}".format(target["username"])
+                conn.execute(
+                    """UPDATE syslog SET user_id=NULL,
+                       details=CASE WHEN length(details)=0 THEN ? ELSE ? || char(59) || char(32) || details END
+                       WHERE user_id=?""",
+                    (deleted_user, deleted_user, target_id),
+                )
                 conn.execute("DELETE FROM users WHERE id=?", (target_id,))
                 log_activity(conn, user["id"], "delete", "user", target_id, target["username"])
                 return self.json({"ok": True})
@@ -903,8 +1519,10 @@ class Handler(BaseHTTPRequestHandler):
                 action = "activate" if active else "deactivate"
                 log_activity(conn, user["id"], action, "user", target_id, target["username"])
                 return self.json({"ok": True})
-            fields = [data["username"], data["full_name"], data["role"], int(data.get("active", target["active"])), target_id]
+            roles = data.get("roles") or [data.get("role")]
+            fields = [data["username"], data["full_name"], roles[0], int(data.get("active", target["active"])), target_id]
             conn.execute("UPDATE users SET username=?, full_name=?, role=?, active=? WHERE id=?", fields)
+            set_user_roles(conn, target_id, roles)
             if data.get("password"):
                 conn.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_password(data["password"]), target_id))
             log_activity(conn, user["id"], "update", "user", target_id, data["username"])
